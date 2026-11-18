@@ -8,6 +8,8 @@ on:
   push:
     paths: ['projects/**']
   workflow_dispatch:
+    inputs:
+      zip: { description: 'projects/<name>/<name>.zip to rebuild (empty = zips changed by the last commit)', required: false }
 permissions:
   contents: write
 concurrency:
@@ -24,14 +26,19 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - id: d
+        env:
+          ZIP_IN: ${{ github.event.inputs.zip }}
         run: |
           B="${{ github.event.before }}"
-          if [ -z "$B" ] || [ "$B" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$B^{commit}" 2>/dev/null; then
+          F=""
+          if [ -n "$ZIP_IN" ]; then
+            F="$ZIP_IN"   # manual rebuild of one zip, requested from the app
+          elif [ -z "$B" ] || [ "$B" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$B^{commit}" 2>/dev/null; then
             F=$(git diff-tree --no-commit-id --name-only --diff-filter=AM -r "${{ github.sha }}" -- 'projects/*.zip')
           else
             F=$(git diff --name-only --diff-filter=AM "$B" "${{ github.sha }}" -- 'projects/*.zip')
           fi
-          case "$(git log -1 --format=%s "${{ github.sha }}")" in "CloudForge: build "*) F="";; esac   # never rebuild because of our own APK commit
+          case "$(git log -1 --format=%s "${{ github.sha }}")" in "CloudForge: build "*) [ -z "$ZIP_IN" ] && F="";; esac   # never rebuild because of our own APK commit
           echo "Added/updated zips:"; echo "$F"
           echo "zips=$(echo "$F" | sed '/^$/d' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
 
@@ -72,6 +79,10 @@ jobs:
           fi
           ls -la _src
           echo "FLUTTER=$([ -f _src/pubspec.yaml ] && echo true || echo false)" >> "$GITHUB_ENV"
+          # plain Gradle project without a wrapper (no gradlew, not Node-based): install Gradle ourselves
+          if [ -z "$(find _src -name gradlew -not -path '*/node_modules/*' | head -1)" ] && [ ! -f _src/pubspec.yaml ] && [ ! -f _src/package.json ]; then
+            echo "NEED_GRADLE=true" >> "$GITHUB_ENV"
+          fi
           echo "NAME=$(basename "${{ matrix.zip }}" .zip)" >> "$GITHUB_ENV"
 
       - uses: actions/setup-java@v4
@@ -81,6 +92,10 @@ jobs:
       - uses: subosito/flutter-action@v2
         if: env.FLUTTER == 'true'
         with: { channel: stable }
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: env.NEED_GRADLE == 'true'
+        with: { gradle-version: '8.9' }
 
       - name: Build release
         working-directory: _src
@@ -98,9 +113,16 @@ jobs:
               fi
             fi
             G=$(find . -name gradlew -not -path '*/node_modules/*' | head -1)
-            if [ -z "$G" ]; then echo "::error::No Android project found (gradlew missing). Put project files at the zip root."; exit 1; fi
-            cd "$(dirname "$G")"; chmod +x gradlew
-            ./gradlew assembleRelease --no-daemon --stacktrace
+            if [ -n "$G" ]; then
+              cd "$(dirname "$G")"; chmod +x gradlew
+              ./gradlew assembleRelease --no-daemon --stacktrace
+            else
+              # no wrapper: use the Gradle installed above, from the folder that holds settings.gradle(.kts)
+              S=$(find . -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/node_modules/*' | head -1)
+              if [ -z "$S" ]; then echo "::error::No Android project found (no gradlew and no settings.gradle). Put the project files at the zip root."; exit 1; fi
+              cd "$(dirname "$S")"
+              gradle assembleRelease --no-daemon --stacktrace
+            fi
           fi
 
       - name: Sign APK (persistent key from repo secrets)
